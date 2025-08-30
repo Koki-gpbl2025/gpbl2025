@@ -10,8 +10,10 @@ Deps:
   pip install google-genai google-cloud-speech google-cloud-texttospeech sounddevice pynput
 """
 
-from google import genai
-from google.genai import types, errors
+import google.generativeai as genai
+from google.generativeai import types       
+from google.api_core import exceptions      
+
 from google.cloud import speech_v1 as speech
 from google.cloud import texttospeech_v1 as tts
 
@@ -189,80 +191,79 @@ def build_cfg_for_chat(state_json: str, strict: bool=False) -> types.GenerateCon
     )
 
 # ========= LLM calls =========
-def llm_extract_general(g_client, utterance: str, EXTRACT_GENERAL_CFG):
+def llm_extract_general(utterance: str, EXTRACT_GENERAL_CFG):
     try:
-        utterance = normalize_en(utterance)
-        r = g_client.models.generate_content(
-            model=MODEL,
-            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance)])],
+        utterance_n = normalize_en(utterance)
+        r = MODEL_CLIENT.generate_content(
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance_n)])],
             config=EXTRACT_GENERAL_CFG
         )
         data = json.loads(r.text or "{}")
         return normalize_extract(data)
-    except Exception:
+    except Exception as e:
+        print("LLM extract error:", e)
         return {}
 
-def llm_extract_focused(g_client, card: dict, answer: str):
+def llm_extract_focused(utterance: str, EXTRACT_FOCUSED_CFG):
     try:
-        answer_n = normalize_en(answer)
-        cfg = build_extract_focused_cfg(card["key"], card["prompt"])
-        r = g_client.models.generate_content(
-            model=MODEL,
-            contents=[types.Content(role="user", parts=[types.Part.from_text(text=answer_n)])],
-            config=cfg
+        utterance_n = normalize_en(utterance)
+        r = MODEL_CLIENT.generate_content(
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance_n)])],
+            config=EXTRACT_FOCUSED_CFG
         )
         data = json.loads(r.text or "{}")
-        data = normalize_extract(data)
-        if card["type"] == "bool" and data.get(card["key"]) is None:
-            h = card_specific_bool(card["key"], answer_n)
-            if h is None: h = bool_heuristic(answer_n)
-            if h is not None: data = {card["key"]: h}
-        return data
-    except Exception:
-        if card["type"] == "bool":
-            answer_n = normalize_en(answer)
-            h = card_specific_bool(card["key"], answer_n)
-            if h is None: h = bool_heuristic(answer_n)
-            if h is not None: return {card["key"]: h}
+        return normalize_extract(data)
+    except Exception as e:
+        # optional: print("LLM focused extract error:", e)
         return {}
 
-def guard_flags(g_client, text: str, GUARD_CFG):
+
+def guard_flags(utterance: str, GUARD_CFG):
     try:
-        r = g_client.models.generate_content(
-            model=MODEL,
-            contents=[types.Content(role="user", parts=[types.Part.from_text(text=text)])],
+        utterance_n = normalize_en(utterance)
+        r = MODEL_CLIENT.generate_content(
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance_n)])],
             config=GUARD_CFG
         )
         data = json.loads(r.text or "{}")
-        return bool(data.get("is_topic", False)), bool(data.get("is_question", False))
-    except Exception:
-        return (False, False)
+        return data
+    except Exception as e:
+        # optional: print("Guard check error:", e)
+        return {}
 
-def gen_chat_with_guard(g_client, history, user_text, state_capsule, GUARD_CFG):
-    def generate_once(strict=False):
-        cfg = build_cfg_for_chat(state_capsule, strict=strict)
-        resp = g_client.models.generate_content(
-            model=MODEL,
-            contents=history+[types.Content(role="user", parts=[types.Part.from_text(text=user_text)])],
-            config=cfg
+
+def gen_chat_with_guard(utterance: str, CHAT_CFG, GUARD_CFG):
+    try:
+        utterance_n = normalize_en(utterance)
+        # Step 1: run guard
+        guard_r = MODEL_CLIENT.generate_content(
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance_n)])],
+            config=GUARD_CFG
         )
-        return (resp.text or "").strip()
+        guard_data = json.loads(guard_r.text or "{}")
 
-    cand = generate_once(False)
-    tries = 0
-    topic, quest = guard_flags(g_client, cand, GUARD_CFG)
-    while (topic or quest) and tries < 2:
-        cand = generate_once(True)
-        tries += 1
-        topic, quest = guard_flags(g_client, cand, GUARD_CFG)
+        # If guard flags unsafe, return info only
+        if guard_data.get("blocked", False):
+            return {
+                "reply": "⚠️ Content blocked by guardrails",
+                "guard": guard_data
+            }
 
-    if topic or quest or not cand:
-        cand = random.choice([
-            "Thanks. How has your day been?",
-            "Got it. What are you up to next?",
-            "Nice. Anything you enjoyed recently?"
-        ])
-    return cand
+        # Step 2: run main chat model
+        chat_r = MODEL_CLIENT.generate_content(
+            contents=[types.Content(role="user", parts=[types.Part.from_text(text=utterance_n)])],
+            config=CHAT_CFG
+        )
+        return {
+            "reply": chat_r.text or "",
+            "guard": guard_data
+        }
+    except Exception as e:
+        return {
+            "reply": "❌ Error while generating response",
+            "guard": {}
+        }
+
 
 # ========= Utilities =========
 def normalize_extract(d: dict) -> dict:
@@ -425,10 +426,14 @@ def main():
     GUARD_CFG = build_guard_cfg(enabled_keys)
 
     # Gemini
-    api_key = args.api_key or EMBEDDED_API_KEY
-    if not api_key:
-        print("Gemini API key not found. Pass --api-key or set GEMINI_API_KEY."); sys.exit(1)
-    g_client = genai.Client(api_key=api_key)
+  api_key = args.api_key or EMBEDDED_API_KEY
+  if not api_key:
+    print("Gemini API key not found. Pass --api-key or set GEMINI_API_KEY."); sys.exit(1)
+
+  # Configure genai and create one model client object to reuse
+  genai.configure(api_key=api_key)
+  MODEL_CLIENT = genai.GenerativeModel(MODEL)
+
 
     # GCP
     try:
@@ -527,8 +532,12 @@ def main():
                 state_capsule = build_state_capsule("CHAT", None, SESSION["signals"], TARGET_SIGNALS)
                 try:
                     text = gen_chat_with_guard(g_client, history[:-1], u, state_capsule, GUARD_CFG)
-                except errors.APIError as e:
-                    print("API error:", e.message); text = "Thanks."
+                except exceptions.GoogleAPICallError as e:
+                    print("API call error:", e)
+                except exceptions.RetryError as e:
+                    print("Retry error:", e)
+                except Exception as e:
+                    print("Unexpected error:", e)
                 if not text: text = "Thanks."
                 if len(text) > 400: text = text[:380] + "... (let me know if you want more)"
                 print("\nRobot> " + text + "\n"); speak_gcloud_tts(tts_client, text, enabled=args.speak)
